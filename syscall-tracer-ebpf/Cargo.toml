@@ -1,0 +1,17 @@
+[package]
+name = "syscall-tracer-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+syscall-tracer-common = { path = "../syscall-tracer-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "syscall-tracer"
+path = "src/main.rs"
