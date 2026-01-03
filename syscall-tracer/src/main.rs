@@ -1,7 +1,14 @@
-use aya::programs::TracePoint;
+use aya::{
+    maps::RingBuf,
+    programs::TracePoint,
+};
 #[rustfmt::skip]
-use log::{debug, warn};
-use tokio::signal;
+use log::debug;
+use syscall_tracer_common::ExecEvent;
+use tokio::{
+    io::{Interest, unix::AsyncFd},
+    signal,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,26 +29,27 @@ async fn main() -> anyhow::Result<()> {
         env!("OUT_DIR"),
         "/syscall-tracer"
     )))?;
-    match aya_log::EbpfLogger::init(&mut ebpf) {
-        Err(e) => {
-            warn!("failed to initialize eBPF logger: {e}");
-        }
-        Ok(logger) => {
-            let mut logger =
-                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-            tokio::task::spawn(async move {
-                loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
-                }
-            });
-        }
-    }
 
     let program: &mut TracePoint = ebpf.program_mut("syscall_tracer").unwrap().try_into()?;
     program.load()?;
     program.attach("syscalls", "sys_enter_execve")?;
+
+    let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
+    let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
+
+    println!("{:>8} {:>8} {:<16} PATH", "PID", "UID", "COMM");
+    tokio::spawn(async move {
+        loop {
+            let Ok(mut guard) = poll.readable_mut().await else {
+                break;
+            };
+            let rb = guard.get_inner_mut();
+            while let Some(item) = rb.next() {
+                print_exec_event(&item);
+            }
+            guard.clear_ready();
+        }
+    });
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
@@ -49,4 +57,19 @@ async fn main() -> anyhow::Result<()> {
     println!("Exiting...");
 
     Ok(())
+}
+
+fn print_exec_event(raw: &[u8]) {
+    if raw.len() < core::mem::size_of::<ExecEvent>() {
+        return;
+    }
+    // SAFETY: `raw` comes from the EVENTS ring buffer, which only ever holds
+    // `ExecEvent` records written by the ebpf program (see syscall-tracer-ebpf).
+    let event = unsafe { &*(raw.as_ptr() as *const ExecEvent) };
+    let comm = core::str::from_utf8(&event.comm)
+        .unwrap_or("")
+        .trim_end_matches('\0');
+    let path = core::str::from_utf8(&event.filename[..event.filename_len as usize])
+        .unwrap_or("<invalid utf8>");
+    println!("{:>8} {:>8} {:<16} {}", event.pid, event.uid, comm, path);
 }
