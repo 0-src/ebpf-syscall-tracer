@@ -54,15 +54,24 @@ cargo build
 
 ## Run
 
-Attaching a tracepoint program requires root:
+Attaching a tracepoint program requires root — but run plain `cargo run`,
+**not** `sudo cargo run`. `.cargo/config.toml` sets the runner to `sudo -E`,
+so cargo builds unprivileged (needed: your regular user's rustup toolchain,
+not root's, which likely doesn't have the nightly + rust-src setup at all)
+and only escalates for the final step of executing the compiled tracer,
+prompting for your password at that point:
 
 ```sh
-sudo cargo run
+cargo run
 ```
 
-(`.cargo/config.toml` sets the runner to `sudo -E`, so plain `cargo run`
-prompts for your password and then runs as root.) Trigger some execve calls
-in another shell and watch the event stream:
+Running `sudo cargo run` instead puts the *entire* build under root's
+environment, which typically doesn't have rustup/nightly installed and falls
+back to the system toolchain — producing `can't find crate for core` when it
+tries to cross-compile the eBPF object. If you hit that error, it means
+`sudo` was applied one level too high.
+
+Trigger some execve calls in another shell and watch the event stream:
 
 ```
 KIND       PID      UID COMM             PATH
