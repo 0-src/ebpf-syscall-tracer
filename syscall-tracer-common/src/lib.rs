@@ -12,6 +12,16 @@ pub enum EventKind {
     Write = 1,
 }
 
+impl EventKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Exec),
+            1 => Some(Self::Write),
+            _ => None,
+        }
+    }
+}
+
 /// A single kernel-boundary observation: either an exec or a creating write,
 /// captured at the relevant `syscalls:sys_enter_*` tracepoint. Detection
 /// rules correlate these in userspace.
