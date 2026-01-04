@@ -15,10 +15,18 @@ use syscall_tracer_common::{COMM_LEN, EventKind, PATH_LEN, TraceEvent};
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
-// Offset of `const char *filename` in the sys_enter_execve tracepoint record, per
-// /sys/kernel/debug/tracing/events/syscalls/sys_enter_execve/format (x86_64: 8-byte
-// common header + 4-byte __syscall_nr + 4-byte padding).
+// Syscall tracepoint records store the raw syscall args as consecutive 8-byte
+// slots starting right after the 8-byte common header + 4-byte __syscall_nr
+// (padded to 8), regardless of each arg's declared C type. Offsets below are
+// read from /sys/kernel/debug/tracing/events/syscalls/<name>/format (x86_64).
+
+// sys_enter_execve(filename, argv, envp): filename is arg0.
 const EXECVE_FILENAME_OFFSET: usize = 16;
+
+// sys_enter_openat(dfd, filename, flags, mode): filename is arg1, flags is arg2.
+const OPENAT_FILENAME_OFFSET: usize = 24;
+const OPENAT_FLAGS_OFFSET: usize = 32;
+const O_CREAT: i64 = 0o100;
 
 #[tracepoint]
 pub fn syscall_tracer(ctx: TracePointContext) -> u32 {
@@ -34,6 +42,30 @@ fn try_exec(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
     emit(EventKind::Exec, path_ptr)
+}
+
+#[tracepoint]
+pub fn trace_openat(ctx: TracePointContext) -> u32 {
+    match try_openat(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_openat(ctx: TracePointContext) -> Result<u32, u32> {
+    // Only a creating open is interesting here (a brand new file being
+    // written); plain reads/writes of existing files are noise for the
+    // dropper signal this feeds.
+    let flags = unsafe { ctx.read_at::<i64>(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? };
+    if flags & O_CREAT == 0 {
+        return Ok(0);
+    }
+
+    let path_ptr = unsafe {
+        ctx.read_at::<*const u8>(OPENAT_FILENAME_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    emit(EventKind::Write, path_ptr)
 }
 
 fn emit(kind: EventKind, path_ptr: *const u8) -> Result<u32, u32> {

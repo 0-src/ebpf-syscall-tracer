@@ -34,6 +34,10 @@ async fn main() -> anyhow::Result<()> {
     program.load()?;
     program.attach("syscalls", "sys_enter_execve")?;
 
+    let program: &mut TracePoint = ebpf.program_mut("trace_openat").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_openat")?;
+
     let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
