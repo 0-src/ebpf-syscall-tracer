@@ -4,7 +4,7 @@ use aya::{
 };
 #[rustfmt::skip]
 use log::debug;
-use syscall_tracer_common::ExecEvent;
+use syscall_tracer_common::{EventKind, TraceEvent};
 use tokio::{
     io::{Interest, unix::AsyncFd},
     signal,
@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
-    println!("{:>8} {:>8} {:<16} PATH", "PID", "UID", "COMM");
+    println!("{:<5} {:>8} {:>8} {:<16} PATH", "KIND", "PID", "UID", "COMM");
     tokio::spawn(async move {
         loop {
             let Ok(mut guard) = poll.readable_mut().await else {
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let rb = guard.get_inner_mut();
             while let Some(item) = rb.next() {
-                print_exec_event(&item);
+                print_trace_event(&item);
             }
             guard.clear_ready();
         }
@@ -59,17 +59,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_exec_event(raw: &[u8]) {
-    if raw.len() < core::mem::size_of::<ExecEvent>() {
+fn print_trace_event(raw: &[u8]) {
+    if raw.len() < core::mem::size_of::<TraceEvent>() {
         return;
     }
     // SAFETY: `raw` comes from the EVENTS ring buffer, which only ever holds
-    // `ExecEvent` records written by the ebpf program (see syscall-tracer-ebpf).
-    let event = unsafe { &*(raw.as_ptr() as *const ExecEvent) };
+    // `TraceEvent` records written by the ebpf program (see syscall-tracer-ebpf).
+    let event = unsafe { &*(raw.as_ptr() as *const TraceEvent) };
+    let kind = match event.kind {
+        k if k == EventKind::Exec as u8 => "EXEC",
+        k if k == EventKind::Write as u8 => "WRITE",
+        _ => "?",
+    };
     let comm = core::str::from_utf8(&event.comm)
         .unwrap_or("")
         .trim_end_matches('\0');
-    let path = core::str::from_utf8(&event.filename[..event.filename_len as usize])
-        .unwrap_or("<invalid utf8>");
-    println!("{:>8} {:>8} {:<16} {}", event.pid, event.uid, comm, path);
+    let path = core::str::from_utf8(&event.path[..event.path_len as usize]).unwrap_or("<invalid utf8>");
+    println!("{:<5} {:>8} {:>8} {:<16} {}", kind, event.pid, event.uid, comm, path);
 }
