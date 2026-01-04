@@ -6,10 +6,12 @@ the kernel boundary.
 
 ## Status
 
-Early. The pipeline for one detection's raw data source is up end-to-end:
-`sys_enter_execve` tracepoint → ring buffer → decoded userspace event. None
-of the detection rules (dropper pattern, self-replace, cross-process ptrace,
-reverse-shell shape, persistence writes) are implemented yet.
+Early. Two probes feed the ring buffer (`sys_enter_execve`, and
+`sys_enter_openat` filtered to `O_CREAT`), and the first detection rule is
+live: **dropper pattern** — a path opened for creation, then execve'd by the
+same pid within a short window. Not yet implemented: self-replace
+(`unlink`+`exec`-of-self), cross-process `ptrace`, reverse-shell shape,
+persistence writes.
 
 ## Architecture
 
@@ -27,12 +29,13 @@ eBPF programs                 loader + reader (Rust, aya)
                                             TUI / JSON log
 ```
 
-- `syscall-tracer-ebpf` — the in-kernel program(s). Kept tiny: read, filter,
+- `syscall-tracer-ebpf` — the in-kernel programs. Kept tiny: read, filter,
   emit. No analysis happens here.
-- `syscall-tracer-common` — the `#[repr(C)]` event types shared, byte-for-byte,
-  between kernel and userspace.
+- `syscall-tracer-common` — the `#[repr(C)]` `TraceEvent` type (tagged
+  exec/write) shared, byte-for-byte, between kernel and userspace.
 - `syscall-tracer` — loads the eBPF object, attaches programs, drains the
-  ring buffer, and will host the stateful detection layer.
+  ring buffer, and hosts the stateful detection layer (`src/detection.rs`),
+  keyed by pid and tested independent of the kernel/eBPF plumbing.
 
 ## Build
 
@@ -62,16 +65,22 @@ prompts for your password and then runs as root.) Trigger some execve calls
 in another shell and watch the event stream:
 
 ```
-    PID      UID COMM             PATH
-   4213     1000 ls               /usr/bin/ls
-   4214     1000 cat              /usr/bin/cat
+KIND       PID      UID COMM             PATH
+WRITE     4213     1000 tee              /tmp/payload
+EXEC      4213     1000 tee              /tmp/payload
+[ALERT] dropper pattern: pid=4213 uid=1000 wrote then exec'd /tmp/payload (12ms later)
+```
+
+Run the unit tests for the detection logic (pure state-machine code, no
+kernel/root needed):
+
+```sh
+cargo test -p syscall-tracer
 ```
 
 ## Roadmap
 
-- Detection state machine, keyed by pid/pgid, starting with the dropper
-  pattern (write to a path, then execve of that same path within N ms).
-- Additional probes: `unlink`+`exec`-of-self, `ptrace` between unrelated
-  processes, reverse-shell shape (shell with a socket as stdin/stdout),
-  persistence writes (cron dirs, systemd units, shell rc files).
+- Additional probes and rules: `unlink`+`exec`-of-self, `ptrace` between
+  unrelated processes, reverse-shell shape (shell with a socket as stdin/
+  stdout), persistence writes (cron dirs, systemd units, shell rc files).
 - Live terminal view plus a JSON event log for later review.
