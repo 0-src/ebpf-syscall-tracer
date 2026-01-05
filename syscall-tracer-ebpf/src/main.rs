@@ -31,6 +31,12 @@ const O_CREAT: i64 = 0o100;
 // sys_enter_unlinkat(dfd, pathname, flag): pathname is arg1.
 const UNLINKAT_PATHNAME_OFFSET: usize = 24;
 
+// sys_enter_unlink(pathname): pathname is arg0. Legacy syscall (nr 87 on
+// x86_64) — still what glibc's unlink() issues directly on at least some
+// libc/kernel combos, rather than routing through unlinkat like open() does
+// through openat(). Trace both to not miss it.
+const UNLINK_PATHNAME_OFFSET: usize = 16;
+
 #[tracepoint]
 pub fn syscall_tracer(ctx: TracePointContext) -> u32 {
     match try_exec(ctx) {
@@ -82,6 +88,22 @@ pub fn trace_unlinkat(ctx: TracePointContext) -> u32 {
 fn try_unlinkat(ctx: TracePointContext) -> Result<u32, u32> {
     let path_ptr = unsafe {
         ctx.read_at::<*const u8>(UNLINKAT_PATHNAME_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    emit(EventKind::Unlink, path_ptr)
+}
+
+#[tracepoint]
+pub fn trace_unlink(ctx: TracePointContext) -> u32 {
+    match try_unlink(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_unlink(ctx: TracePointContext) -> Result<u32, u32> {
+    let path_ptr = unsafe {
+        ctx.read_at::<*const u8>(UNLINK_PATHNAME_OFFSET)
             .map_err(|_| 1u32)?
     };
     emit(EventKind::Unlink, path_ptr)

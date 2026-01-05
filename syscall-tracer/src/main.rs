@@ -59,6 +59,10 @@ async fn main() -> anyhow::Result<()> {
     program.load()?;
     program.attach("syscalls", "sys_enter_unlinkat")?;
 
+    let program: &mut TracePoint = ebpf.program_mut("trace_unlink").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_unlink")?;
+
     let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
