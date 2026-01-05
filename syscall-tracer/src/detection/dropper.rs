@@ -9,7 +9,7 @@ pub struct DropperDetector {
     recent_writes: HashMap<(u32, String), u64>,
 }
 
-pub struct Alert {
+pub struct DropperAlert {
     pub pid: u32,
     pub uid: u32,
     pub path: String,
@@ -24,9 +24,9 @@ impl DropperDetector {
         }
     }
 
-    /// Feed one decoded event. Returns `Some(Alert)` if this event completes
-    /// a write→exec pattern within the window.
-    pub fn observe(&mut self, kind: EventKind, pid: u32, uid: u32, path: &str, ktime_ns: u64) -> Option<Alert> {
+    /// Feed one decoded event. Returns `Some(DropperAlert)` if this event
+    /// completes a write→exec pattern within the window.
+    pub fn observe(&mut self, kind: EventKind, pid: u32, uid: u32, path: &str, ktime_ns: u64) -> Option<DropperAlert> {
         match kind {
             EventKind::Write => {
                 self.recent_writes.insert((pid, path.to_owned()), ktime_ns);
@@ -36,7 +36,7 @@ impl DropperDetector {
             EventKind::Exec => {
                 let write_ktime = self.recent_writes.remove(&(pid, path.to_owned()))?;
                 let delta_ns = ktime_ns.saturating_sub(write_ktime);
-                (delta_ns <= self.window_ns).then(|| Alert {
+                (delta_ns <= self.window_ns).then(|| DropperAlert {
                     pid,
                     uid,
                     path: path.to_owned(),

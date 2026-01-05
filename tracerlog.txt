@@ -1,0 +1,11 @@
+KIND       PID      UID COMM             PATH
+Waiting for Ctrl-C...
+EXEC    269149     1000 bash             /usr/local/bin/starship
+EXEC    269158     1000 bash             /usr/bin/python3
+WRITE   267926     1000 bash             /dev/null
+EXEC    269160     1000 bash             /usr/local/bin/starship
+EXEC    269169     1000 bash             /usr/local/bin/starship
+EXEC    269182     1000 bash             /usr/bin/sed
+EXEC    269183     1000 bash             /usr/libexec/vte-urlencode-cwd
+WRITE     3502     1000 wireplumber      /home/rob/.local/state/wireplumber/stream-properties.7CCRS3
+Exiting...
