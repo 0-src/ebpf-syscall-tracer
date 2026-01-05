@@ -6,14 +6,27 @@ the kernel boundary.
 
 ## Status
 
-Early. Three probes feed the ring buffer (`sys_enter_execve`,
-`sys_enter_openat` filtered to `O_CREAT`, and `sys_enter_unlinkat`). Two
-detection rules are live:
+Early. Four probes feed the ring buffer (`sys_enter_execve`,
+`sys_enter_openat` filtered to `O_CREAT`, and both `sys_enter_unlinkat` and
+the legacy `sys_enter_unlink` — glibc's `unlink()` doesn't consistently route
+through `unlinkat()` the way `open()` routes through `openat()`, so both are
+traced). Two detection rules are live, both verified against real triggers:
 
 - **dropper pattern** — a path opened for creation, then execve'd by the
   same pid within a short window.
 - **self-replace** — a process unlinking the on-disk path it's currently
   running as, then re-exec'ing that same path within a short window.
+
+**Known limitation:** self-replace tracks "what binary is this pid running"
+purely from the path argument of the most recent `execve` syscall. That's
+wrong for `#!/usr/bin/env <interpreter>`-shebang'd scripts: `env` does its
+own `$PATH` search as separate, real `execve` syscalls after the kernel's
+shebang resolution, so the tracked path ends up being the last `$PATH`
+candidate `env` tried (e.g. `/usr/bin/python3`), not the original script
+path — and the self-unlink of the script never matches. A direct interpreter
+shebang (`#!/usr/bin/python3`, no `env`) or a compiled binary doesn't hit
+this. Real EDR tools resolve this with argv-aware correlation; out of scope
+for this MVP.
 
 Not yet implemented: cross-process `ptrace`, reverse-shell shape,
 persistence writes.
@@ -89,7 +102,9 @@ EXEC   4213     1000 tee              /tmp/payload
 Self-replace requires a process that unlinks the exact path it's currently
 running as, then re-execs that same path — not something an interactive
 shell reproduces naturally, since each external command is a fresh
-fork+exec. A single process doing it to itself (no fork) is the real shape:
+fork+exec. A single process doing it to itself (no fork) is the real shape
+(and, per the limitation above, avoid an `env`-based shebang for a script
+payload):
 
 ```
 UNLINK 4310     1000 agent            /opt/agent
