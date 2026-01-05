@@ -12,11 +12,20 @@ use tokio::{
     signal,
 };
 
-use detection::DropperDetector;
+use detection::{DropperDetector, SelfReplaceDetector};
 
 /// A write immediately followed by an exec of the same path, within this
 /// window, is flagged as a dropper.
 const DROPPER_WINDOW_NS: u64 = 2_000_000_000; // 2s
+
+/// A process unlinking its own binary, then re-exec'ing the same path,
+/// within this window, is flagged as a self-replace.
+const SELF_REPLACE_WINDOW_NS: u64 = 2_000_000_000; // 2s
+
+struct Detectors {
+    dropper: DropperDetector,
+    self_replace: SelfReplaceDetector,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,16 +62,19 @@ async fn main() -> anyhow::Result<()> {
     let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
-    println!("{:<5} {:>8} {:>8} {:<16} PATH", "KIND", "PID", "UID", "COMM");
+    println!("{:<6} {:>8} {:>8} {:<16} PATH", "KIND", "PID", "UID", "COMM");
     tokio::spawn(async move {
-        let mut dropper = DropperDetector::new(DROPPER_WINDOW_NS);
+        let mut detectors = Detectors {
+            dropper: DropperDetector::new(DROPPER_WINDOW_NS),
+            self_replace: SelfReplaceDetector::new(SELF_REPLACE_WINDOW_NS),
+        };
         loop {
             let Ok(mut guard) = poll.readable_mut().await else {
                 break;
             };
             let rb = guard.get_inner_mut();
             while let Some(item) = rb.next() {
-                handle_trace_event(&item, &mut dropper);
+                handle_trace_event(&item, &mut detectors);
             }
             guard.clear_ready();
         }
@@ -76,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_trace_event(raw: &[u8], dropper: &mut DropperDetector) {
+fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
     if raw.len() < core::mem::size_of::<TraceEvent>() {
         return;
     }
@@ -96,11 +108,21 @@ fn handle_trace_event(raw: &[u8], dropper: &mut DropperDetector) {
         EventKind::Write => "WRITE",
         EventKind::Unlink => "UNLINK",
     };
-    println!("{:<5} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path);
+    println!("{:<6} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path);
 
-    if let Some(alert) = dropper.observe(kind, event.pid, event.uid, path, event.ktime_ns) {
+    if let Some(alert) = detectors.dropper.observe(kind, event.pid, event.uid, path, event.ktime_ns) {
         println!(
             "[ALERT] dropper pattern: pid={} uid={} wrote then exec'd {} ({}ms later)",
+            alert.pid, alert.uid, alert.path, alert.delta_ms
+        );
+    }
+
+    if let Some(alert) = detectors
+        .self_replace
+        .observe(kind, event.pid, event.uid, path, event.ktime_ns)
+    {
+        println!(
+            "[ALERT] self-replace: pid={} uid={} unlinked then re-exec'd {} ({}ms later)",
             alert.pid, alert.uid, alert.path, alert.delta_ms
         );
     }
