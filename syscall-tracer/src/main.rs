@@ -46,6 +46,10 @@ async fn main() -> anyhow::Result<()> {
     program.load()?;
     program.attach("syscalls", "sys_enter_openat")?;
 
+    let program: &mut TracePoint = ebpf.program_mut("trace_unlinkat").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_unlinkat")?;
+
     let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
@@ -90,6 +94,7 @@ fn handle_trace_event(raw: &[u8], dropper: &mut DropperDetector) {
     let kind_label = match kind {
         EventKind::Exec => "EXEC",
         EventKind::Write => "WRITE",
+        EventKind::Unlink => "UNLINK",
     };
     println!("{:<5} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path);
 

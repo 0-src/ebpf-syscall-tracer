@@ -43,6 +43,7 @@ impl DropperDetector {
                     delta_ms: delta_ns / 1_000_000,
                 })
             }
+            EventKind::Unlink => None,
         }
     }
 

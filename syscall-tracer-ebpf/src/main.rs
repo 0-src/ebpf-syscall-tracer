@@ -28,6 +28,9 @@ const OPENAT_FILENAME_OFFSET: usize = 24;
 const OPENAT_FLAGS_OFFSET: usize = 32;
 const O_CREAT: i64 = 0o100;
 
+// sys_enter_unlinkat(dfd, pathname, flag): pathname is arg1.
+const UNLINKAT_PATHNAME_OFFSET: usize = 24;
+
 #[tracepoint]
 pub fn syscall_tracer(ctx: TracePointContext) -> u32 {
     match try_exec(ctx) {
@@ -66,6 +69,22 @@ fn try_openat(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)?
     };
     emit(EventKind::Write, path_ptr)
+}
+
+#[tracepoint]
+pub fn trace_unlinkat(ctx: TracePointContext) -> u32 {
+    match try_unlinkat(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_unlinkat(ctx: TracePointContext) -> Result<u32, u32> {
+    let path_ptr = unsafe {
+        ctx.read_at::<*const u8>(UNLINKAT_PATHNAME_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    emit(EventKind::Unlink, path_ptr)
 }
 
 fn emit(kind: EventKind, path_ptr: *const u8) -> Result<u32, u32> {

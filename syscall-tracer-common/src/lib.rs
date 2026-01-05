@@ -10,6 +10,8 @@ pub enum EventKind {
     Exec = 0,
     /// A path was opened with O_CREAT (a new file being written).
     Write = 1,
+    /// A path was unlinked (deleted).
+    Unlink = 2,
 }
 
 impl EventKind {
@@ -17,6 +19,7 @@ impl EventKind {
         match v {
             0 => Some(Self::Exec),
             1 => Some(Self::Write),
+            2 => Some(Self::Unlink),
             _ => None,
         }
     }
