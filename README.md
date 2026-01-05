@@ -6,11 +6,16 @@ the kernel boundary.
 
 ## Status
 
-Early. Two probes feed the ring buffer (`sys_enter_execve`, and
-`sys_enter_openat` filtered to `O_CREAT`), and the first detection rule is
-live: **dropper pattern** — a path opened for creation, then execve'd by the
-same pid within a short window. Not yet implemented: self-replace
-(`unlink`+`exec`-of-self), cross-process `ptrace`, reverse-shell shape,
+Early. Three probes feed the ring buffer (`sys_enter_execve`,
+`sys_enter_openat` filtered to `O_CREAT`, and `sys_enter_unlinkat`). Two
+detection rules are live:
+
+- **dropper pattern** — a path opened for creation, then execve'd by the
+  same pid within a short window.
+- **self-replace** — a process unlinking the on-disk path it's currently
+  running as, then re-exec'ing that same path within a short window.
+
+Not yet implemented: cross-process `ptrace`, reverse-shell shape,
 persistence writes.
 
 ## Architecture
@@ -32,10 +37,11 @@ eBPF programs                 loader + reader (Rust, aya)
 - `syscall-tracer-ebpf` — the in-kernel programs. Kept tiny: read, filter,
   emit. No analysis happens here.
 - `syscall-tracer-common` — the `#[repr(C)]` `TraceEvent` type (tagged
-  exec/write) shared, byte-for-byte, between kernel and userspace.
+  exec/write/unlink) shared, byte-for-byte, between kernel and userspace.
 - `syscall-tracer` — loads the eBPF object, attaches programs, drains the
-  ring buffer, and hosts the stateful detection layer (`src/detection.rs`),
-  keyed by pid and tested independent of the kernel/eBPF plumbing.
+  ring buffer, and hosts the stateful detection layer (`src/detection/`, one
+  module per rule), keyed by pid and tested independent of the kernel/eBPF
+  plumbing.
 
 ## Build
 
@@ -74,10 +80,21 @@ tries to cross-compile the eBPF object. If you hit that error, it means
 Trigger some execve calls in another shell and watch the event stream:
 
 ```
-KIND       PID      UID COMM             PATH
-WRITE     4213     1000 tee              /tmp/payload
-EXEC      4213     1000 tee              /tmp/payload
+KIND   PID      UID COMM             PATH
+WRITE  4213     1000 tee              /tmp/payload
+EXEC   4213     1000 tee              /tmp/payload
 [ALERT] dropper pattern: pid=4213 uid=1000 wrote then exec'd /tmp/payload (12ms later)
+```
+
+Self-replace requires a process that unlinks the exact path it's currently
+running as, then re-execs that same path — not something an interactive
+shell reproduces naturally, since each external command is a fresh
+fork+exec. A single process doing it to itself (no fork) is the real shape:
+
+```
+UNLINK 4310     1000 agent            /opt/agent
+EXEC   4310     1000 agent            /opt/agent
+[ALERT] self-replace: pid=4310 uid=1000 unlinked then re-exec'd /opt/agent (8ms later)
 ```
 
 Run the unit tests for the detection logic (pure state-machine code, no
@@ -89,7 +106,7 @@ cargo test -p syscall-tracer
 
 ## Roadmap
 
-- Additional probes and rules: `unlink`+`exec`-of-self, `ptrace` between
-  unrelated processes, reverse-shell shape (shell with a socket as stdin/
-  stdout), persistence writes (cron dirs, systemd units, shell rc files).
+- Additional probes and rules: `ptrace` between unrelated processes,
+  reverse-shell shape (shell with a socket as stdin/stdout), persistence
+  writes (cron dirs, systemd units, shell rc files).
 - Live terminal view plus a JSON event log for later review.
