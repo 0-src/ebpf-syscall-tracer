@@ -6,16 +6,22 @@ the kernel boundary.
 
 ## Status
 
-Early. Four probes feed the ring buffer (`sys_enter_execve`,
-`sys_enter_openat` filtered to `O_CREAT`, and both `sys_enter_unlinkat` and
-the legacy `sys_enter_unlink` — glibc's `unlink()` doesn't consistently route
+Early. Five probes feed the ring buffer (`sys_enter_execve`,
+`sys_enter_openat` filtered to `O_CREAT`, both `sys_enter_unlinkat` and the
+legacy `sys_enter_unlink` — glibc's `unlink()` doesn't consistently route
 through `unlinkat()` the way `open()` routes through `openat()`, so both are
-traced). Two detection rules are live, both verified against real triggers:
+traced — and `sys_enter_ptrace` filtered to `PTRACE_ATTACH`/`PTRACE_SEIZE`).
+Three detection rules are live, all verified against real triggers:
 
 - **dropper pattern** — a path opened for creation, then execve'd by the
   same pid within a short window.
 - **self-replace** — a process unlinking the on-disk path it's currently
   running as, then re-exec'ing that same path within a short window.
+- **cross-process ptrace** — a `PTRACE_ATTACH`/`PTRACE_SEIZE` where the
+  tracer isn't the target's parent (checked via `/proc/<pid>/status`'s
+  `PPid`, not kernel task-struct walking, to keep the eBPF side tiny). If
+  ancestry can't be resolved at all, it fails secure — treated as unrelated
+  rather than silently ignored.
 
 **Known limitation:** self-replace tracks "what binary is this pid running"
 purely from the path argument of the most recent `execve` syscall. That's
@@ -28,8 +34,7 @@ shebang (`#!/usr/bin/python3`, no `env`) or a compiled binary doesn't hit
 this. Real EDR tools resolve this with argv-aware correlation; out of scope
 for this MVP.
 
-Not yet implemented: cross-process `ptrace`, reverse-shell shape,
-persistence writes.
+Not yet implemented: reverse-shell shape, persistence writes.
 
 ## Architecture
 
@@ -50,7 +55,8 @@ eBPF programs                 loader + reader (Rust, aya)
 - `syscall-tracer-ebpf` — the in-kernel programs. Kept tiny: read, filter,
   emit. No analysis happens here.
 - `syscall-tracer-common` — the `#[repr(C)]` `TraceEvent` type (tagged
-  exec/write/unlink) shared, byte-for-byte, between kernel and userspace.
+  exec/write/unlink/ptrace) shared, byte-for-byte, between kernel and
+  userspace.
 - `syscall-tracer` — loads the eBPF object, attaches programs, drains the
   ring buffer, and hosts the stateful detection layer (`src/detection/`, one
   module per rule), keyed by pid and tested independent of the kernel/eBPF
@@ -112,6 +118,15 @@ EXEC   4310     1000 agent            /opt/agent
 [ALERT] self-replace: pid=4310 uid=1000 unlinked then re-exec'd /opt/agent (8ms later)
 ```
 
+Cross-process ptrace needs a `PTRACE_ATTACH`/`PTRACE_SEIZE` where the tracer
+isn't the target's parent — e.g. attach to an unrelated already-running
+process (root or matching uid; the target must not already be traced):
+
+```
+PTRACE 5120     1000 python3          target_pid=4980
+[ALERT] cross-process ptrace: pid=5120 uid=1000 attached to unrelated pid 4980
+```
+
 Run the unit tests for the detection logic (pure state-machine code, no
 kernel/root needed):
 
@@ -121,7 +136,7 @@ cargo test -p syscall-tracer
 
 ## Roadmap
 
-- Additional probes and rules: `ptrace` between unrelated processes,
-  reverse-shell shape (shell with a socket as stdin/stdout), persistence
-  writes (cron dirs, systemd units, shell rc files).
+- Additional probes and rules: reverse-shell shape (shell with a socket as
+  stdin/stdout), persistence writes (cron dirs, systemd units, shell rc
+  files).
 - Live terminal view plus a JSON event log for later review.
