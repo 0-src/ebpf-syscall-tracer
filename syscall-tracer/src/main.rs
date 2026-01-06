@@ -12,7 +12,7 @@ use tokio::{
     signal,
 };
 
-use detection::{DropperDetector, SelfReplaceDetector};
+use detection::{DropperDetector, ProcFsParentLookup, PtraceDetector, SelfReplaceDetector};
 
 /// A write immediately followed by an exec of the same path, within this
 /// window, is flagged as a dropper.
@@ -25,6 +25,7 @@ const SELF_REPLACE_WINDOW_NS: u64 = 2_000_000_000; // 2s
 struct Detectors {
     dropper: DropperDetector,
     self_replace: SelfReplaceDetector,
+    ptrace: PtraceDetector<ProcFsParentLookup>,
 }
 
 #[tokio::main]
@@ -63,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
     program.load()?;
     program.attach("syscalls", "sys_enter_unlink")?;
 
+    let program: &mut TracePoint = ebpf.program_mut("trace_ptrace").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_ptrace")?;
+
     let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
@@ -71,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         let mut detectors = Detectors {
             dropper: DropperDetector::new(DROPPER_WINDOW_NS),
             self_replace: SelfReplaceDetector::new(SELF_REPLACE_WINDOW_NS),
+            ptrace: PtraceDetector::new(ProcFsParentLookup),
         };
         loop {
             let Ok(mut guard) = poll.readable_mut().await else {
@@ -111,8 +117,16 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
         EventKind::Exec => "EXEC",
         EventKind::Write => "WRITE",
         EventKind::Unlink => "UNLINK",
+        EventKind::Ptrace => "PTRACE",
     };
-    println!("{:<6} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path);
+    if kind == EventKind::Ptrace {
+        println!(
+            "{:<6} {:>8} {:>8} {:<16} target_pid={}",
+            kind_label, event.pid, event.uid, comm, event.target_pid
+        );
+    } else {
+        println!("{:<6} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path);
+    }
 
     if let Some(alert) = detectors.dropper.observe(kind, event.pid, event.uid, path, event.ktime_ns) {
         println!(
@@ -129,5 +143,14 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
             "[ALERT] self-replace: pid={} uid={} unlinked then re-exec'd {} ({}ms later)",
             alert.pid, alert.uid, alert.path, alert.delta_ms
         );
+    }
+
+    if kind == EventKind::Ptrace {
+        if let Some(alert) = detectors.ptrace.observe(event.pid, event.uid, event.target_pid) {
+            println!(
+                "[ALERT] cross-process ptrace: pid={} uid={} attached to unrelated pid {}",
+                alert.tracer_pid, alert.tracer_uid, alert.target_pid
+            );
+        }
     }
 }

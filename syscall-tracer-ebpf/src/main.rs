@@ -37,6 +37,16 @@ const UNLINKAT_PATHNAME_OFFSET: usize = 24;
 // through openat(). Trace both to not miss it.
 const UNLINK_PATHNAME_OFFSET: usize = 16;
 
+// sys_enter_ptrace(request, pid, addr, data): request is arg0, target pid is arg1.
+const PTRACE_REQUEST_OFFSET: usize = 16;
+const PTRACE_PID_OFFSET: usize = 24;
+// Only these two requests actually attach to an *existing* process; everything
+// else (PEEK/POKE/CONT/... or PTRACE_TRACEME, which a child issues on itself)
+// either requires an existing attach already or is the ordinary, benign
+// debugger-launches-its-own-child pattern.
+const PTRACE_ATTACH: i64 = 16;
+const PTRACE_SEIZE: i64 = 0x4206;
+
 #[tracepoint]
 pub fn syscall_tracer(ctx: TracePointContext) -> u32 {
     match try_exec(ctx) {
@@ -109,6 +119,24 @@ fn try_unlink(ctx: TracePointContext) -> Result<u32, u32> {
     emit(EventKind::Unlink, path_ptr)
 }
 
+#[tracepoint]
+pub fn trace_ptrace(ctx: TracePointContext) -> u32 {
+    match try_ptrace(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_ptrace(ctx: TracePointContext) -> Result<u32, u32> {
+    let request = unsafe { ctx.read_at::<i64>(PTRACE_REQUEST_OFFSET).map_err(|_| 1u32)? };
+    if request != PTRACE_ATTACH && request != PTRACE_SEIZE {
+        return Ok(0);
+    }
+
+    let target_pid = unsafe { ctx.read_at::<i64>(PTRACE_PID_OFFSET).map_err(|_| 1u32)? };
+    emit_ptrace(target_pid as u32)
+}
+
 fn emit(kind: EventKind, path_ptr: *const u8) -> Result<u32, u32> {
     let mut event = TraceEvent {
         kind: kind as u8,
@@ -118,12 +146,35 @@ fn emit(kind: EventKind, path_ptr: *const u8) -> Result<u32, u32> {
         comm: [0u8; COMM_LEN],
         path: [0u8; PATH_LEN],
         path_len: 0,
+        target_pid: 0,
     };
 
     event.comm = bpf_get_current_comm().map_err(|_| 1u32)?;
 
     let path = unsafe { bpf_probe_read_user_str_bytes(path_ptr, &mut event.path).map_err(|_| 1u32)? };
     event.path_len = path.len() as u32;
+
+    if let Some(mut entry) = EVENTS.reserve::<TraceEvent>(0) {
+        entry.write(event);
+        entry.submit(0);
+    }
+
+    Ok(0)
+}
+
+fn emit_ptrace(target_pid: u32) -> Result<u32, u32> {
+    let mut event = TraceEvent {
+        kind: EventKind::Ptrace as u8,
+        pid: (bpf_get_current_pid_tgid() >> 32) as u32,
+        uid: bpf_get_current_uid_gid() as u32,
+        ktime_ns: unsafe { bpf_ktime_get_ns() },
+        comm: [0u8; COMM_LEN],
+        path: [0u8; PATH_LEN],
+        path_len: 0,
+        target_pid,
+    };
+
+    event.comm = bpf_get_current_comm().map_err(|_| 1u32)?;
 
     if let Some(mut entry) = EVENTS.reserve::<TraceEvent>(0) {
         entry.write(event);

@@ -12,6 +12,8 @@ pub enum EventKind {
     Write = 1,
     /// A path was unlinked (deleted).
     Unlink = 2,
+    /// A PTRACE_ATTACH or PTRACE_SEIZE of another pid.
+    Ptrace = 3,
 }
 
 impl EventKind {
@@ -20,14 +22,16 @@ impl EventKind {
             0 => Some(Self::Exec),
             1 => Some(Self::Write),
             2 => Some(Self::Unlink),
+            3 => Some(Self::Ptrace),
             _ => None,
         }
     }
 }
 
-/// A single kernel-boundary observation: either an exec or a creating write,
-/// captured at the relevant `syscalls:sys_enter_*` tracepoint. Detection
-/// rules correlate these in userspace.
+/// A single kernel-boundary observation, captured at the relevant
+/// `syscalls:sys_enter_*` tracepoint. Detection rules correlate these in
+/// userspace. `path`/`path_len` are unused for `Ptrace` events; `target_pid`
+/// is unused for the others.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TraceEvent {
@@ -38,6 +42,7 @@ pub struct TraceEvent {
     pub comm: [u8; COMM_LEN],
     pub path: [u8; PATH_LEN],
     pub path_len: u32,
+    pub target_pid: u32,
 }
 
 #[cfg(feature = "user")]

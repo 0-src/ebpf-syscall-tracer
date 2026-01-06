@@ -60,7 +60,7 @@ impl SelfReplaceDetector {
                 }
                 None
             }
-            EventKind::Write => None,
+            EventKind::Write | EventKind::Ptrace => None,
         }
     }
 
