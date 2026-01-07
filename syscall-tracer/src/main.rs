@@ -12,7 +12,9 @@ use tokio::{
     signal,
 };
 
-use detection::{DropperDetector, ProcFsParentLookup, PtraceDetector, SelfReplaceDetector};
+use detection::{
+    DropperDetector, ProcFsFdKind, ProcFsParentLookup, PtraceDetector, ReverseShellDetector, SelfReplaceDetector,
+};
 
 /// A write immediately followed by an exec of the same path, within this
 /// window, is flagged as a dropper.
@@ -26,6 +28,7 @@ struct Detectors {
     dropper: DropperDetector,
     self_replace: SelfReplaceDetector,
     ptrace: PtraceDetector<ProcFsParentLookup>,
+    reverse_shell: ReverseShellDetector<ProcFsFdKind>,
 }
 
 #[tokio::main]
@@ -77,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             dropper: DropperDetector::new(DROPPER_WINDOW_NS),
             self_replace: SelfReplaceDetector::new(SELF_REPLACE_WINDOW_NS),
             ptrace: PtraceDetector::new(ProcFsParentLookup),
+            reverse_shell: ReverseShellDetector::new(ProcFsFdKind),
         };
         loop {
             let Ok(mut guard) = poll.readable_mut().await else {
@@ -150,6 +154,15 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
             println!(
                 "[ALERT] cross-process ptrace: pid={} uid={} attached to unrelated pid {}",
                 alert.tracer_pid, alert.tracer_uid, alert.target_pid
+            );
+        }
+    }
+
+    if kind == EventKind::Exec {
+        if let Some(alert) = detectors.reverse_shell.observe(event.pid, event.uid, path) {
+            println!(
+                "[ALERT] reverse shell: pid={} uid={} {} has a socket on stdin/stdout",
+                alert.pid, alert.uid, alert.path
             );
         }
     }
