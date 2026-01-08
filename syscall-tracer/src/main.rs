@@ -13,7 +13,8 @@ use tokio::{
 };
 
 use detection::{
-    DropperDetector, ProcFsFdKind, ProcFsParentLookup, PtraceDetector, ReverseShellDetector, SelfReplaceDetector,
+    DropperDetector, PersistenceWriteDetector, ProcFsFdKind, ProcFsParentLookup, PtraceDetector,
+    ReverseShellDetector, SelfReplaceDetector,
 };
 
 /// A write immediately followed by an exec of the same path, within this
@@ -29,6 +30,7 @@ struct Detectors {
     self_replace: SelfReplaceDetector,
     ptrace: PtraceDetector<ProcFsParentLookup>,
     reverse_shell: ReverseShellDetector<ProcFsFdKind>,
+    persistence: PersistenceWriteDetector,
 }
 
 #[tokio::main]
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             self_replace: SelfReplaceDetector::new(SELF_REPLACE_WINDOW_NS),
             ptrace: PtraceDetector::new(ProcFsParentLookup),
             reverse_shell: ReverseShellDetector::new(ProcFsFdKind),
+            persistence: PersistenceWriteDetector::new(),
         };
         loop {
             let Ok(mut guard) = poll.readable_mut().await else {
@@ -163,6 +166,18 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
             println!(
                 "[ALERT] reverse shell: pid={} uid={} {} has a socket on stdin/stdout",
                 alert.pid, alert.uid, alert.path
+            );
+        }
+    }
+
+    if kind == EventKind::Write {
+        if let Some(alert) = detectors.persistence.observe(event.pid, event.uid, path) {
+            println!(
+                "[ALERT] persistence write ({}): pid={} uid={} wrote {}",
+                alert.category.label(),
+                alert.pid,
+                alert.uid,
+                alert.path
             );
         }
     }
