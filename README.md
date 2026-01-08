@@ -6,12 +6,12 @@ the kernel boundary.
 
 ## Status
 
-Early. Five probes feed the ring buffer (`sys_enter_execve`,
+Core detection set complete. Five probes feed the ring buffer (`sys_enter_execve`,
 `sys_enter_openat` filtered to `O_CREAT`, both `sys_enter_unlinkat` and the
 legacy `sys_enter_unlink` — glibc's `unlink()` doesn't consistently route
 through `unlinkat()` the way `open()` routes through `openat()`, so both are
 traced — and `sys_enter_ptrace` filtered to `PTRACE_ATTACH`/`PTRACE_SEIZE`).
-Four detection rules are live, all verified against real triggers:
+Five detection rules are live, all verified against real triggers:
 
 - **dropper pattern** — a path opened for creation, then execve'd by the
   same pid within a short window.
@@ -27,19 +27,34 @@ Four detection rules are live, all verified against real triggers:
   reverse shell `dup2()`s its socket onto stdin/stdout *before* calling
   `execve`, and those fds persist across the exec, so this reuses the
   existing exec events and checks `/proc/<pid>/fd/{0,1}` right after.
+- **persistence writes** — a creating write into a known persistence
+  location: cron dirs (`/etc/cron.*/`, `/etc/crontab`, `/var/spool/cron/`),
+  systemd unit paths (`/etc/systemd/system/`, `/usr/lib/systemd/system/`,
+  per-user `~/.config/systemd/user/`), or shell rc files (`.bashrc`,
+  `.zshrc`, `/etc/profile`, `/etc/profile.d/*.sh`, ...). Also no new probe —
+  pure path classification on the existing write events.
 
-**Known limitation:** self-replace tracks "what binary is this pid running"
-purely from the path argument of the most recent `execve` syscall. That's
-wrong for `#!/usr/bin/env <interpreter>`-shebang'd scripts: `env` does its
-own `$PATH` search as separate, real `execve` syscalls after the kernel's
-shebang resolution, so the tracked path ends up being the last `$PATH`
-candidate `env` tried (e.g. `/usr/bin/python3`), not the original script
-path — and the self-unlink of the script never matches. A direct interpreter
-shebang (`#!/usr/bin/python3`, no `env`) or a compiled binary doesn't hit
-this. Real EDR tools resolve this with argv-aware correlation; out of scope
-for this MVP.
+**Known limitations:**
 
-Not yet implemented: persistence writes.
+- Persistence writes only fire on the existing `O_CREAT`-filtered write
+  probe. In practice most real edits still pass `O_CREAT` (shell `>>`
+  append, `sed -i`, `crontab -e`'s temp-file-then-rename, most editors), so
+  this covers the common case, but a write that opens an existing rc file
+  with plain `O_WRONLY`/`O_TRUNC` (no `O_CREAT`) is invisible to this tracer.
+  A dedicated probe watching those specific paths regardless of flags would
+  close the gap; out of scope for this MVP.
+- Self-replace tracks "what binary is this pid running" purely from the path
+  argument of the most recent `execve` syscall. That's wrong for
+  `#!/usr/bin/env <interpreter>`-shebang'd scripts: `env` does its own
+  `$PATH` search as separate, real `execve` syscalls after the kernel's
+  shebang resolution, so the tracked path ends up being the last `$PATH`
+  candidate `env` tried (e.g. `/usr/bin/python3`), not the original script
+  path — and the self-unlink of the script never matches. A direct
+  interpreter shebang (`#!/usr/bin/python3`, no `env`) or a compiled binary
+  doesn't hit this. Real EDR tools resolve this with argv-aware correlation;
+  out of scope for this MVP.
+
+All five detections from the original brief are implemented.
 
 ## Architecture
 
@@ -141,6 +156,14 @@ EXEC   5401     1000 bash             /bin/bash
 [ALERT] reverse shell: pid=5401 uid=1000 /bin/bash has a socket on stdin/stdout
 ```
 
+Persistence writes just need a creating write into a watched path, e.g.
+`echo "* * * * * evil" >> /etc/cron.d/backdoor` or `echo evil >> ~/.bashrc`:
+
+```
+WRITE  5502     0    bash             /etc/cron.d/backdoor
+[ALERT] persistence write (cron): pid=5502 uid=0 wrote /etc/cron.d/backdoor
+```
+
 Run the unit tests for the detection logic (pure state-machine code, no
 kernel/root needed):
 
@@ -150,6 +173,4 @@ cargo test -p syscall-tracer
 
 ## Roadmap
 
-- Additional probes and rules: persistence writes (cron dirs, systemd units,
-  shell rc files).
 - Live terminal view plus a JSON event log for later review.
