@@ -1,4 +1,5 @@
 mod detection;
+mod jsonlog;
 
 use aya::{
     maps::RingBuf,
@@ -16,6 +17,7 @@ use detection::{
     DropperDetector, PersistenceWriteDetector, ProcFsFdKind, ProcFsParentLookup, PtraceDetector,
     ReverseShellDetector, SelfReplaceDetector,
 };
+use jsonlog::JsonLog;
 
 /// A write immediately followed by an exec of the same path, within this
 /// window, is flagged as a dropper.
@@ -24,6 +26,8 @@ const DROPPER_WINDOW_NS: u64 = 2_000_000_000; // 2s
 /// A process unlinking its own binary, then re-exec'ing the same path,
 /// within this window, is flagged as a self-replace.
 const SELF_REPLACE_WINDOW_NS: u64 = 2_000_000_000; // 2s
+
+const JSON_LOG_PATH: &str = "syscall-tracer.jsonl";
 
 struct Detectors {
     dropper: DropperDetector,
@@ -76,6 +80,9 @@ async fn main() -> anyhow::Result<()> {
     let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
+    let mut json_log = JsonLog::open(JSON_LOG_PATH)?;
+    println!("Logging events to {JSON_LOG_PATH}");
+
     println!("{:<6} {:>8} {:>8} {:<16} PATH", "KIND", "PID", "UID", "COMM");
     tokio::spawn(async move {
         let mut detectors = Detectors {
@@ -91,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let rb = guard.get_inner_mut();
             while let Some(item) = rb.next() {
-                handle_trace_event(&item, &mut detectors);
+                handle_trace_event(&item, &mut detectors, &mut json_log);
             }
             guard.clear_ready();
         }
@@ -105,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
+fn handle_trace_event(raw: &[u8], detectors: &mut Detectors, json_log: &mut JsonLog) {
     if raw.len() < core::mem::size_of::<TraceEvent>() {
         return;
     }
@@ -134,11 +141,19 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
     } else {
         println!("{:<6} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path);
     }
+    json_log.log_event(kind_label, event.pid, event.uid, comm, path, event.target_pid);
 
     if let Some(alert) = detectors.dropper.observe(kind, event.pid, event.uid, path, event.ktime_ns) {
         println!(
             "[ALERT] dropper pattern: pid={} uid={} wrote then exec'd {} ({}ms later)",
             alert.pid, alert.uid, alert.path, alert.delta_ms
+        );
+        json_log.log_alert(
+            "dropper",
+            alert.pid,
+            alert.uid,
+            &alert.path,
+            format!("wrote then exec'd within {}ms", alert.delta_ms),
         );
     }
 
@@ -150,6 +165,13 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
             "[ALERT] self-replace: pid={} uid={} unlinked then re-exec'd {} ({}ms later)",
             alert.pid, alert.uid, alert.path, alert.delta_ms
         );
+        json_log.log_alert(
+            "self-replace",
+            alert.pid,
+            alert.uid,
+            &alert.path,
+            format!("unlinked then re-exec'd within {}ms", alert.delta_ms),
+        );
     }
 
     if kind == EventKind::Ptrace {
@@ -157,6 +179,13 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
             println!(
                 "[ALERT] cross-process ptrace: pid={} uid={} attached to unrelated pid {}",
                 alert.tracer_pid, alert.tracer_uid, alert.target_pid
+            );
+            json_log.log_alert(
+                "ptrace",
+                alert.tracer_pid,
+                alert.tracer_uid,
+                "",
+                format!("attached to unrelated pid {}", alert.target_pid),
             );
         }
     }
@@ -166,6 +195,13 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
             println!(
                 "[ALERT] reverse shell: pid={} uid={} {} has a socket on stdin/stdout",
                 alert.pid, alert.uid, alert.path
+            );
+            json_log.log_alert(
+                "reverse-shell",
+                alert.pid,
+                alert.uid,
+                &alert.path,
+                "socket on stdin/stdout".to_string(),
             );
         }
     }
@@ -178,6 +214,13 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors) {
                 alert.pid,
                 alert.uid,
                 alert.path
+            );
+            json_log.log_alert(
+                "persistence",
+                alert.pid,
+                alert.uid,
+                &alert.path,
+                format!("category={}", alert.category.label()),
             );
         }
     }
