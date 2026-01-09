@@ -10,4 +10,5 @@ target/
 
 # Local run logs from manual testing
 *.log
+*.jsonl
 tracerlog.txt

