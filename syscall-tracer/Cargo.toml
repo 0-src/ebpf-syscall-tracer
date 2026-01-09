@@ -9,11 +9,13 @@ syscall-tracer-common = { path = "../syscall-tracer-common", features = ["user"]
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+crossterm = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+ratatui = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, default-features = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
     "rt",

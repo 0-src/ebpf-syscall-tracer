@@ -1,5 +1,8 @@
 mod detection;
 mod jsonlog;
+mod tui;
+
+use std::sync::mpsc::Sender;
 
 use aya::{
     maps::RingBuf,
@@ -8,16 +11,14 @@ use aya::{
 #[rustfmt::skip]
 use log::debug;
 use syscall_tracer_common::{EventKind, TraceEvent};
-use tokio::{
-    io::{Interest, unix::AsyncFd},
-    signal,
-};
+use tokio::io::{Interest, unix::AsyncFd};
 
 use detection::{
     DropperDetector, PersistenceWriteDetector, ProcFsFdKind, ProcFsParentLookup, PtraceDetector,
     ReverseShellDetector, SelfReplaceDetector,
 };
 use jsonlog::JsonLog;
+use tui::DisplayEvent;
 
 /// A write immediately followed by an exec of the same path, within this
 /// window, is flagged as a dropper.
@@ -81,9 +82,11 @@ async fn main() -> anyhow::Result<()> {
     let mut poll = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
 
     let mut json_log = JsonLog::open(JSON_LOG_PATH)?;
-    println!("Logging events to {JSON_LOG_PATH}");
 
-    println!("{:<6} {:>8} {:>8} {:<16} PATH", "KIND", "PID", "UID", "COMM");
+    let (tx, rx) = std::sync::mpsc::channel::<DisplayEvent>();
+
+    println!("All probes attached. Logging to {JSON_LOG_PATH}. Launching UI...");
+
     tokio::spawn(async move {
         let mut detectors = Detectors {
             dropper: DropperDetector::new(DROPPER_WINDOW_NS),
@@ -98,21 +101,21 @@ async fn main() -> anyhow::Result<()> {
             };
             let rb = guard.get_inner_mut();
             while let Some(item) = rb.next() {
-                handle_trace_event(&item, &mut detectors, &mut json_log);
+                handle_trace_event(&item, &mut detectors, &mut json_log, &tx);
             }
             guard.clear_ready();
         }
     });
 
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    // Blocking: crossterm's event polling is synchronous, so the TUI runs on
+    // its own thread rather than as an async task.
+    tokio::task::spawn_blocking(move || tui::run(rx)).await??;
 
+    // `ebpf` is still in scope here and drops on return, detaching the probes.
     Ok(())
 }
 
-fn handle_trace_event(raw: &[u8], detectors: &mut Detectors, json_log: &mut JsonLog) {
+fn handle_trace_event(raw: &[u8], detectors: &mut Detectors, json_log: &mut JsonLog, tx: &Sender<DisplayEvent>) {
     if raw.len() < core::mem::size_of::<TraceEvent>() {
         return;
     }
@@ -133,95 +136,80 @@ fn handle_trace_event(raw: &[u8], detectors: &mut Detectors, json_log: &mut Json
         EventKind::Unlink => "UNLINK",
         EventKind::Ptrace => "PTRACE",
     };
-    if kind == EventKind::Ptrace {
-        println!(
+    let event_text = if kind == EventKind::Ptrace {
+        format!(
             "{:<6} {:>8} {:>8} {:<16} target_pid={}",
             kind_label, event.pid, event.uid, comm, event.target_pid
-        );
+        )
     } else {
-        println!("{:<6} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path);
-    }
+        format!("{:<6} {:>8} {:>8} {:<16} {}", kind_label, event.pid, event.uid, comm, path)
+    };
+    let _ = tx.send(DisplayEvent::Trace {
+        kind: kind_label,
+        text: event_text,
+    });
     json_log.log_event(kind_label, event.pid, event.uid, comm, path, event.target_pid);
 
     if let Some(alert) = detectors.dropper.observe(kind, event.pid, event.uid, path, event.ktime_ns) {
-        println!(
-            "[ALERT] dropper pattern: pid={} uid={} wrote then exec'd {} ({}ms later)",
+        let text = format!(
+            "pid={} uid={} wrote then exec'd {} ({}ms later)",
             alert.pid, alert.uid, alert.path, alert.delta_ms
         );
-        json_log.log_alert(
-            "dropper",
-            alert.pid,
-            alert.uid,
-            &alert.path,
-            format!("wrote then exec'd within {}ms", alert.delta_ms),
-        );
+        json_log.log_alert("dropper", alert.pid, alert.uid, &alert.path, text.clone());
+        let _ = tx.send(DisplayEvent::Alert { rule: "dropper", text });
     }
 
     if let Some(alert) = detectors
         .self_replace
         .observe(kind, event.pid, event.uid, path, event.ktime_ns)
     {
-        println!(
-            "[ALERT] self-replace: pid={} uid={} unlinked then re-exec'd {} ({}ms later)",
+        let text = format!(
+            "pid={} uid={} unlinked then re-exec'd {} ({}ms later)",
             alert.pid, alert.uid, alert.path, alert.delta_ms
         );
-        json_log.log_alert(
-            "self-replace",
-            alert.pid,
-            alert.uid,
-            &alert.path,
-            format!("unlinked then re-exec'd within {}ms", alert.delta_ms),
-        );
+        json_log.log_alert("self-replace", alert.pid, alert.uid, &alert.path, text.clone());
+        let _ = tx.send(DisplayEvent::Alert {
+            rule: "self-replace",
+            text,
+        });
     }
 
     if kind == EventKind::Ptrace {
         if let Some(alert) = detectors.ptrace.observe(event.pid, event.uid, event.target_pid) {
-            println!(
-                "[ALERT] cross-process ptrace: pid={} uid={} attached to unrelated pid {}",
+            let text = format!(
+                "pid={} uid={} attached to unrelated pid {}",
                 alert.tracer_pid, alert.tracer_uid, alert.target_pid
             );
-            json_log.log_alert(
-                "ptrace",
-                alert.tracer_pid,
-                alert.tracer_uid,
-                "",
-                format!("attached to unrelated pid {}", alert.target_pid),
-            );
+            json_log.log_alert("ptrace", alert.tracer_pid, alert.tracer_uid, "", text.clone());
+            let _ = tx.send(DisplayEvent::Alert { rule: "ptrace", text });
         }
     }
 
     if kind == EventKind::Exec {
         if let Some(alert) = detectors.reverse_shell.observe(event.pid, event.uid, path) {
-            println!(
-                "[ALERT] reverse shell: pid={} uid={} {} has a socket on stdin/stdout",
-                alert.pid, alert.uid, alert.path
-            );
-            json_log.log_alert(
-                "reverse-shell",
-                alert.pid,
-                alert.uid,
-                &alert.path,
-                "socket on stdin/stdout".to_string(),
-            );
+            let text = format!("pid={} uid={} {} has a socket on stdin/stdout", alert.pid, alert.uid, alert.path);
+            json_log.log_alert("reverse-shell", alert.pid, alert.uid, &alert.path, text.clone());
+            let _ = tx.send(DisplayEvent::Alert {
+                rule: "reverse-shell",
+                text,
+            });
         }
     }
 
     if kind == EventKind::Write {
         if let Some(alert) = detectors.persistence.observe(event.pid, event.uid, path) {
-            println!(
-                "[ALERT] persistence write ({}): pid={} uid={} wrote {}",
-                alert.category.label(),
+            let text = format!(
+                "pid={} uid={} wrote {} ({})",
                 alert.pid,
                 alert.uid,
-                alert.path
+                alert.path,
+                alert.category.label()
             );
-            json_log.log_alert(
-                "persistence",
-                alert.pid,
-                alert.uid,
-                &alert.path,
-                format!("category={}", alert.category.label()),
-            );
+            json_log.log_alert("persistence", alert.pid, alert.uid, &alert.path, text.clone());
+            let _ = tx.send(DisplayEvent::Alert {
+                rule: "persistence",
+                text,
+            });
         }
     }
 }
